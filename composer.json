@@ -2,7 +2,7 @@
     "name": "whilesmart/eloquent-runs",
     "description": "Record work done anywhere and its result: runs, attempts with leases, artifacts and logs, executed by CI uploads, pulling workers or the Laravel queue.",
     "type": "library",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "license": "MIT",
     "authors": [
         { "name": "Whilesmart Team" }

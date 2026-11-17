@@ -21,7 +21,7 @@ composer require whilesmart/eloquent-runs
 php artisan migrate
 ```
 
-Schedule the sweep, which expires abandoned attempts and times out overdue runs:
+Schedule the sweep, which expires abandoned attempts, times out overdue runs and recovers queued work:
 
 ```php
 Schedule::command('runs:sweep')->everyMinute();
@@ -60,6 +60,30 @@ Register it in `config/runs.php`:
 ```
 
 A type that runs on the queue also implements `HandlesRun`. Its `handle()` returns the result, or throws `RunFailed` with an error code.
+
+If a handler returns a result that fails its type's validation, the attempt fails with `invalid_result`. The type's `isRetryable()` policy decides whether another attempt is scheduled.
+
+## Queue delivery
+
+Queue delivery is recorded in the same database transaction as the run or retry. The message is sent after commit. A failed push leaves the run queued, and `runs:sweep` tries delivery again. The migration also records delivery for existing queued runs.
+
+Configure recovery in `runs.queue`:
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `dispatch_retry_seconds` | 30 | Wait after a failed queue push |
+| `redispatch_after_seconds` | 300 | Wait before replacing a message whose run has not started |
+| `recovery_batch_size` | 100 | Maximum deliveries recovered per sweep, capped at 1,000 |
+
+The recovery window starts after any retry delay. Duplicate messages cannot skip that delay or start a second active attempt. Queue delivery can happen more than once; handlers that call external systems must still make those operations safe to repeat after a lease expires.
+
+The sweep reports expired attempts, timed out runs and dispatched runs. Keep both the scheduler and queue workers running.
+
+## Request fingerprints
+
+By default, a repeated idempotency key returns the owner's original run. Hosts can pass a server-generated `request_fingerprint` to `RunService::create()` to require matching request content. A different or missing fingerprint then returns `409` with `idempotency_conflict`. Keys created without a fingerprint retain the original behavior when replayed without one.
+
+For HTTP creation, replace `requests.store_run` with a request that computes and validates the fingerprint from trusted, normalized input. The default request does not accept a client-supplied fingerprint. Include every field that changes the meaning of the work, and keep the normalization stable across deployments.
 
 ## Authorization
 
@@ -108,7 +132,7 @@ Dispatched after the database commit: `RunCreated`, `RunClaimed`, `RunRetrySched
 
 In `config/runs.php`, without copying controllers or routes:
 
-- `models`: subclass the run, attempt, artifact or log models.
+- `models`: subclass the run, attempt, artifact, log or dispatch models.
 - `requests.store_run`: replace the request that validates and authorizes run creation.
 - `resources`: replace how runs, attempts and artifacts are serialized.
 - `controllers`: replace a controller as a last resort.
@@ -122,3 +146,5 @@ Bind `Whilesmart\Runs\Contracts\ResponseFormatter` to change the response envelo
 composer test
 composer pint:test
 ```
+
+The MySQL suite requires a dedicated database whose name ends in `_tests`. Concurrent HTTP tests also require PHP's `pcntl` extension. CI runs the suite against SQLite and MySQL; the database queue tests execute real queue workers.

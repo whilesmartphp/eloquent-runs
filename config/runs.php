@@ -11,6 +11,7 @@ use Whilesmart\Runs\Http\Resources\RunResource;
 use Whilesmart\Runs\Models\Run;
 use Whilesmart\Runs\Models\RunArtifact;
 use Whilesmart\Runs\Models\RunAttempt;
+use Whilesmart\Runs\Models\RunDispatch;
 use Whilesmart\Runs\Models\RunLogChunk;
 
 return [
@@ -30,6 +31,7 @@ return [
     'attempts_table' => env('RUNS_ATTEMPTS_TABLE', 'work_run_attempts'),
     'artifacts_table' => env('RUNS_ARTIFACTS_TABLE', 'work_run_artifacts'),
     'log_chunks_table' => env('RUNS_LOG_CHUNKS_TABLE', 'work_run_log_chunks'),
+    'dispatches_table' => env('RUNS_DISPATCHES_TABLE', 'work_run_dispatches'),
 
     // Registered run types: name => class implementing Contracts\RunType.
     'types' => [],
@@ -50,6 +52,9 @@ return [
     'queue' => [
         'connection' => env('RUNS_QUEUE_CONNECTION'),
         'name' => env('RUNS_QUEUE'),
+        'redispatch_after_seconds' => 300,
+        'dispatch_retry_seconds' => 30,
+        'recovery_batch_size' => 100,
     ],
 
     'models' => [
@@ -57,6 +62,7 @@ return [
         'attempt' => RunAttempt::class,
         'artifact' => RunArtifact::class,
         'log_chunk' => RunLogChunk::class,
+        'dispatch' => RunDispatch::class,
     ],
 
     'resources' => [
