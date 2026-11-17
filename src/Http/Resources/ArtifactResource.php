@@ -17,6 +17,7 @@ class ArtifactResource extends JsonResource
             'size' => $this->size,
             'sha256' => $this->sha256,
             'metadata' => $this->metadata,
+            'received' => $this->received_at !== null,
             'received_at' => $this->received_at?->toIso8601String(),
         ];
     }

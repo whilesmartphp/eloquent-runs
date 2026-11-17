@@ -14,7 +14,7 @@ class SweepRunsCommand extends Command
     public function handle(RunService $runs): int
     {
         $swept = $runs->sweep();
-        $this->info("Expired {$swept['expired_attempts']} attempts, timed out {$swept['timed_out_runs']} runs, dispatched {$swept['dispatched_runs']} runs.");
+        $this->info("Expired {$swept['expired_attempts']} attempts, resumed {$swept['resumed_runs']} runs, timed out {$swept['timed_out_runs']} runs, dispatched {$swept['dispatched_runs']} runs.");
 
         return self::SUCCESS;
     }

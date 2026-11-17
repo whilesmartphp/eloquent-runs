@@ -84,6 +84,16 @@ class RunController extends Controller
         return $this->respond(new ($this->resource('run'))($this->runs->cancel($record)));
     }
 
+    /** Continue a waiting run; the body's data is merged into the run's state. */
+    public function resume(Request $request, string $run): JsonResponse
+    {
+        $record = $this->findRun($run);
+        $this->authorizeAccessTo($record, $request->user());
+        $validated = $request->validate(['data' => ['nullable', 'array']]);
+
+        return $this->respond(new ($this->resource('run'))($this->runs->resume($record, $validated['data'] ?? [])));
+    }
+
     public function attempts(Request $request, string $run): JsonResponse
     {
         $record = $this->findRun($run);
@@ -100,6 +110,7 @@ class RunController extends Controller
 
         $artifacts = $record->artifacts()
             ->with('attempt')
+            ->whereNotNull('received_at')
             ->when(! $request->boolean('all'), fn ($q) => $q->where('attempt_id', $record->accepted_attempt_id))
             ->orderBy('id')
             ->get();
@@ -112,7 +123,7 @@ class RunController extends Controller
         $record = $this->findRun($run);
         $this->authorizeAccessTo($record, $request->user());
 
-        $file = $record->artifacts()->where('public_id', $artifact)->firstOrFail();
+        $file = $record->artifacts()->where('public_id', $artifact)->whereNotNull('received_at')->firstOrFail();
 
         return Storage::disk($file->disk)->download($file->storage_key, basename($file->path), [
             'Content-Type' => $file->media_type,

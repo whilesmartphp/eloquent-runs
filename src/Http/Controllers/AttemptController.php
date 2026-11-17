@@ -5,6 +5,7 @@ namespace Whilesmart\Runs\Http\Controllers;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
+use Illuminate\Support\Carbon;
 use Whilesmart\Runs\Enums\RunStatus;
 use Whilesmart\Runs\Exceptions\InvalidLeaseToken;
 use Whilesmart\Runs\Http\Controllers\Concerns\ResolvesRuns;
@@ -25,8 +26,8 @@ class AttemptController extends Controller
 
     public function heartbeat(Request $request, string $attempt): JsonResponse
     {
-        $validated = $request->validate(['progress' => ['nullable', 'array']]);
-        $record = $this->runs->heartbeat($this->findAttempt($attempt), $this->token($request), $validated['progress'] ?? null);
+        $validated = $request->validate(['progress' => ['nullable', 'array'], 'metadata' => ['nullable', 'array']]);
+        $record = $this->runs->heartbeat($this->findAttempt($attempt), $this->token($request), $validated['progress'] ?? null, $validated['metadata'] ?? null);
 
         return $this->respond([
             'attempt' => new ($this->resource('attempt'))($record),
@@ -74,8 +75,8 @@ class AttemptController extends Controller
 
     public function complete(Request $request, string $attempt): JsonResponse
     {
-        $validated = $request->validate(['result' => ['present', 'array']]);
-        $run = $this->runs->complete($this->findAttempt($attempt), $this->token($request), $validated['result']);
+        $validated = $request->validate(['result' => ['present', 'array'], 'metadata' => ['nullable', 'array']]);
+        $run = $this->runs->complete($this->findAttempt($attempt), $this->token($request), $validated['result'], $validated['metadata'] ?? null);
 
         return $this->respond(new ($this->resource('run'))($run));
     }
@@ -85,6 +86,7 @@ class AttemptController extends Controller
         $validated = $request->validate([
             'error_code' => ['required', 'string', 'max:100'],
             'error_message' => ['nullable', 'string', 'max:5000'],
+            'metadata' => ['nullable', 'array'],
         ]);
 
         $run = $this->runs->fail(
@@ -92,6 +94,47 @@ class AttemptController extends Controller
             $this->token($request),
             $validated['error_code'],
             $validated['error_message'] ?? null,
+            null,
+            $validated['metadata'] ?? null,
+        );
+
+        return $this->respond(new ($this->resource('run'))($run));
+    }
+
+    /** Declare the files this attempt will upload, so completion waits for all of them. */
+    public function manifest(Request $request, string $attempt): JsonResponse
+    {
+        $validated = $request->validate([
+            'files' => ['required', 'array', 'max:2000'],
+            'files.*.path' => ['required', 'string', 'max:1024', 'distinct:strict'],
+            'files.*.media_type' => ['required', 'string', 'max:255'],
+            'files.*.size' => ['required', 'integer', 'min:0'],
+            'files.*.sha256' => ['required', 'string', 'regex:/\A[0-9a-fA-F]{64}\z/'],
+            'files.*.type' => ['nullable', 'string', 'max:100'],
+            'files.*.metadata' => ['nullable', 'array'],
+        ]);
+
+        $artifacts = $this->runs->declareArtifacts($this->findAttempt($attempt), $this->token($request), $validated['files']);
+
+        return $this->respond($this->resource('artifact')::collection($artifacts->load('attempt')));
+    }
+
+    public function wait(Request $request, string $attempt): JsonResponse
+    {
+        $validated = $request->validate([
+            'reason' => ['required', 'string', 'max:255'],
+            'state' => ['nullable', 'array'],
+            'resume_at' => ['nullable', 'date', 'after:now'],
+            'metadata' => ['nullable', 'array'],
+        ]);
+
+        $run = $this->runs->wait(
+            $this->findAttempt($attempt),
+            $this->token($request),
+            $validated['reason'],
+            $validated['state'] ?? null,
+            isset($validated['resume_at']) ? Carbon::parse($validated['resume_at']) : null,
+            $validated['metadata'] ?? null,
         );
 
         return $this->respond(new ($this->resource('run'))($run));

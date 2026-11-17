@@ -19,6 +19,6 @@ class TokenRunnerAuthorizer implements RunnerAuthorizer
 
     public function scope(Builder $query, Runner $runner): Builder
     {
-        return $query->where('owner_id', $runner->id);
+        return $query->where('owner_id', Owners::key($runner->id));
     }
 }

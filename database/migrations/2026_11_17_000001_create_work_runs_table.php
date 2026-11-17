@@ -6,12 +6,18 @@ use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
 {
+    private bool $uuids;
+
     public function up(): void
     {
-        Schema::create(config('runs.runs_table', 'work_runs'), function (Blueprint $table) {
-            $table->id();
+        $this->uuids = (bool) config('runs.uuids', false);
+        $runs = config('runs.runs_table', 'work_runs');
+        $attempts = config('runs.attempts_table', 'work_run_attempts');
+
+        Schema::create($runs, function (Blueprint $table) {
+            $this->key($table);
             $table->ulid('public_id')->unique();
-            $table->morphs('owner');
+            $this->uuids ? $table->uuidMorphs('owner') : $table->morphs('owner');
 
             // String ids so a subject, trigger or requester can be any model,
             // whether its key is an integer, a UUID or a ULID.
@@ -27,20 +33,28 @@ return new class extends Migration
             $table->string('execution_mode');
             $table->string('status');
             $table->json('input')->nullable();
+            $table->json('state')->nullable();
             $table->json('result')->nullable();
             $table->json('progress')->nullable();
             $table->json('metadata')->nullable();
             $table->string('idempotency_key', 200)->nullable();
             $table->string('request_fingerprint')->nullable();
+            $table->string('concurrency_key', 200)->nullable();
+            $table->string('concurrency_policy')->default('parallel');
 
             $table->unsignedInteger('attempt_count')->default(0);
+            $table->unsignedInteger('failure_count')->default(0);
             $table->unsignedInteger('max_attempts')->default(1);
             $table->unsignedInteger('lease_seconds');
             $table->unsignedInteger('attempt_timeout_seconds');
             $table->timestamp('available_at')->nullable();
             $table->timestamp('deadline_at')->nullable();
-            $table->unsignedBigInteger('accepted_attempt_id')->nullable();
+            $this->uuids
+                ? $table->uuid('accepted_attempt_id')->nullable()
+                : $table->unsignedBigInteger('accepted_attempt_id')->nullable();
 
+            $table->json('waiting_on')->nullable();
+            $table->timestamp('resume_at')->nullable();
             $table->timestamp('started_at')->nullable();
             $table->timestamp('finished_at')->nullable();
             $table->timestamp('cancel_requested_at')->nullable();
@@ -51,15 +65,17 @@ return new class extends Migration
 
             $table->unique(['owner_type', 'owner_id', 'idempotency_key']);
             $table->index(['owner_type', 'owner_id', 'created_at']);
+            $table->index(['owner_type', 'owner_id', 'concurrency_key', 'status']);
             $table->index(['subject_type', 'subject_id']);
             $table->index(['trigger_type', 'trigger_id']);
             $table->index(['execution_mode', 'status', 'available_at']);
             $table->index(['status', 'deadline_at']);
+            $table->index(['status', 'resume_at']);
         });
 
-        Schema::create(config('runs.dispatches_table', 'work_run_dispatches'), function (Blueprint $table) {
+        Schema::create(config('runs.dispatches_table', 'work_run_dispatches'), function (Blueprint $table) use ($runs) {
             $table->id();
-            $table->foreignId('run_id')->unique()->constrained(config('runs.runs_table', 'work_runs'))->cascadeOnDelete();
+            $this->reference($table, 'run_id', $runs)->unique();
             $table->timestamp('next_dispatch_at')->index();
             $table->uuid('dispatch_token')->nullable();
             $table->unsignedInteger('dispatch_attempts')->default(0);
@@ -67,10 +83,10 @@ return new class extends Migration
             $table->timestamps();
         });
 
-        Schema::create(config('runs.attempts_table', 'work_run_attempts'), function (Blueprint $table) {
-            $table->id();
+        Schema::create($attempts, function (Blueprint $table) use ($runs) {
+            $this->key($table);
             $table->ulid('public_id')->unique();
-            $table->foreignId('run_id')->constrained(config('runs.runs_table', 'work_runs'))->cascadeOnDelete();
+            $this->reference($table, 'run_id', $runs);
             $table->unsignedInteger('number');
             $table->string('status');
             $table->string('executor_type')->nullable();
@@ -83,6 +99,7 @@ return new class extends Migration
             $table->timestamp('started_at')->nullable();
             $table->timestamp('finished_at')->nullable();
             $table->json('result')->nullable();
+            $table->json('metadata')->nullable();
             $table->string('error_code')->nullable();
             $table->text('error_message')->nullable();
             $table->timestamps();
@@ -91,11 +108,11 @@ return new class extends Migration
             $table->index(['status', 'lease_expires_at']);
         });
 
-        Schema::create(config('runs.artifacts_table', 'work_run_artifacts'), function (Blueprint $table) {
-            $table->id();
+        Schema::create(config('runs.artifacts_table', 'work_run_artifacts'), function (Blueprint $table) use ($runs, $attempts) {
+            $this->key($table);
             $table->ulid('public_id')->unique();
-            $table->foreignId('run_id')->constrained(config('runs.runs_table', 'work_runs'))->cascadeOnDelete();
-            $table->foreignId('attempt_id')->constrained(config('runs.attempts_table', 'work_run_attempts'))->cascadeOnDelete();
+            $this->reference($table, 'run_id', $runs);
+            $this->reference($table, 'attempt_id', $attempts);
             $table->string('path', 1024);
             // Long paths cannot be indexed on every database, so uniqueness is kept on a hash.
             $table->char('path_hash', 64);
@@ -103,20 +120,22 @@ return new class extends Migration
             $table->string('media_type');
             $table->unsignedBigInteger('size');
             $table->char('sha256', 64);
-            $table->string('disk');
-            $table->string('storage_key');
+            // Empty until the bytes arrive: a declared file has a row before its upload.
+            $table->string('disk')->nullable();
+            $table->string('storage_key')->nullable();
             $table->timestamp('received_at')->nullable();
             $table->json('metadata')->nullable();
             $table->timestamps();
 
             $table->unique(['attempt_id', 'path_hash']);
-            $table->index(['run_id', 'id']);
+            $table->index(['run_id', 'received_at']);
         });
 
-        Schema::create(config('runs.log_chunks_table', 'work_run_log_chunks'), function (Blueprint $table) {
+        Schema::create(config('runs.log_chunks_table', 'work_run_log_chunks'), function (Blueprint $table) use ($runs, $attempts) {
+            // Always an increasing integer: readers page through logs by this id.
             $table->id();
-            $table->foreignId('run_id')->constrained(config('runs.runs_table', 'work_runs'))->cascadeOnDelete();
-            $table->foreignId('attempt_id')->constrained(config('runs.attempts_table', 'work_run_attempts'))->cascadeOnDelete();
+            $this->reference($table, 'run_id', $runs);
+            $this->reference($table, 'attempt_id', $attempts);
             $table->unsignedInteger('sequence');
             $table->string('stream')->default('stdout');
             $table->text('content');
@@ -135,5 +154,17 @@ return new class extends Migration
         Schema::dropIfExists(config('runs.attempts_table', 'work_run_attempts'));
         Schema::dropIfExists(config('runs.dispatches_table', 'work_run_dispatches'));
         Schema::dropIfExists(config('runs.runs_table', 'work_runs'));
+    }
+
+    private function key(Blueprint $table): void
+    {
+        $this->uuids ? $table->uuid('id')->primary() : $table->id();
+    }
+
+    private function reference(Blueprint $table, string $column, string $on)
+    {
+        return ($this->uuids ? $table->foreignUuid($column) : $table->foreignId($column))
+            ->constrained($on)
+            ->cascadeOnDelete();
     }
 };

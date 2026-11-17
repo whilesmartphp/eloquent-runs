@@ -30,19 +30,21 @@ class RunnerController extends Controller
         $validated = $request->validate([
             'types' => ['nullable', 'array'],
             'types.*' => ['string'],
+            'limit' => ['nullable', 'integer', 'min:1', 'max:50'],
+            'metadata' => ['nullable', 'array'],
         ]);
 
-        $started = $this->runs->claim($runner, $validated['types'] ?? null);
-        if (! $started) {
+        $claims = $this->runs->claim($runner, $validated['types'] ?? null, $validated['limit'] ?? 1, $validated['metadata'] ?? null);
+        if ($claims === []) {
             return response()->noContent();
         }
 
-        $run = $started->attempt->run;
-
         return $this->respond([
-            'run' => new ($this->resource('run'))($run),
-            'attempt' => new ($this->resource('attempt'))($started->attempt),
-            'lease_token' => $started->leaseToken,
+            'claims' => array_map(fn ($started) => [
+                'run' => new ($this->resource('run'))($started->attempt->run),
+                'attempt' => new ($this->resource('attempt'))($started->attempt),
+                'lease_token' => $started->leaseToken,
+            ], $claims),
         ]);
     }
 }

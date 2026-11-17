@@ -11,6 +11,7 @@ use Throwable;
 use Whilesmart\Runs\Contracts\HandlesRun;
 use Whilesmart\Runs\Exceptions\RunConflict;
 use Whilesmart\Runs\Exceptions\RunFailed;
+use Whilesmart\Runs\Exceptions\RunWaits;
 use Whilesmart\Runs\Services\RunService;
 use Whilesmart\Runs\Support\RunModels;
 use Whilesmart\Runs\Support\RunTypeRegistry;
@@ -25,7 +26,7 @@ class ExecuteRun implements ShouldQueue
 
     public int $tries = 1;
 
-    public function __construct(public readonly int $runId) {}
+    public function __construct(public readonly int|string $runId) {}
 
     public function handle(RunService $runs, RunTypeRegistry $types): void
     {
@@ -43,6 +44,10 @@ class ExecuteRun implements ShouldQueue
             }
             try {
                 $result = $handler->handle($run->fresh(), $started->attempt);
+            } catch (RunWaits $e) {
+                $runs->wait($started->attempt, $started->leaseToken, $e->reason, $e->state, $e->resumeAt);
+
+                return;
             } catch (RunFailed $e) {
                 $runs->fail($started->attempt, $started->leaseToken, $e->errorCode, $e->getMessage());
 

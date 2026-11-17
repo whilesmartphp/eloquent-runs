@@ -1,4 +1,9 @@
 ## [0.1.0] - 2026-11-17
+- UUID keys for every run table, its owner and its references, chosen with one setting before the first migration
+- Runs sharing a concurrency key can run in parallel, wait their turn, be refused, or replace the unfinished ones
+- A run can wait for something outside it and resume later, by request or on a timer, without using up retries
+- Attempts can declare their files up front; completion waits for all of them, and hosts can store the bytes themselves
+- Machines can claim several runs at once and record details on each attempt
 - Recover queued runs when a queue push fails or a message disappears before execution
 - Preserve retry delays when duplicate messages reach a worker
 - Settle invalid handler results using the run type's retry policy

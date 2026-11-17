@@ -2,6 +2,8 @@
 
 namespace Whilesmart\Runs\Services;
 
+use DateTimeInterface;
+use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Carbon;
@@ -9,18 +11,22 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
+use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 use Throwable;
 use Whilesmart\Runs\Contracts\RunnerAuthorizer;
 use Whilesmart\Runs\Enums\AttemptStatus;
+use Whilesmart\Runs\Enums\ConcurrencyPolicy;
 use Whilesmart\Runs\Enums\ExecutionMode;
 use Whilesmart\Runs\Enums\RunStatus;
 use Whilesmart\Runs\Events\ArtifactReceived;
 use Whilesmart\Runs\Events\RunCancellationRequested;
 use Whilesmart\Runs\Events\RunClaimed;
 use Whilesmart\Runs\Events\RunCreated;
+use Whilesmart\Runs\Events\RunResumed;
 use Whilesmart\Runs\Events\RunRetryScheduled;
 use Whilesmart\Runs\Events\RunSettled;
+use Whilesmart\Runs\Events\RunWaiting;
 use Whilesmart\Runs\Exceptions\InvalidLeaseToken;
 use Whilesmart\Runs\Exceptions\RunConflict;
 use Whilesmart\Runs\Jobs\ExecuteRun;
@@ -48,7 +54,11 @@ class RunService
     public function create(array $attributes): CreatedRun
     {
         $type = $this->types->get($attributes['type']);
-        Validator::make($attributes, ['request_fingerprint' => ['nullable', 'string', 'max:255']])->validate();
+        Validator::make($attributes, [
+            'request_fingerprint' => ['nullable', 'string', 'max:255'],
+            'concurrency_key' => ['nullable', 'string', 'max:200'],
+            'concurrency_policy' => ['nullable', Rule::in(ConcurrencyPolicy::values())],
+        ])->validate();
         Validator::make(['input' => $attributes['input'] ?? []], $this->prefix('input', $type->inputRules()))->validate();
 
         if ($existing = $this->findByIdempotencyKey($attributes)) {
@@ -59,15 +69,25 @@ class RunService
         }
 
         $mode = ExecutionMode::from($attributes['execution_mode'] ?? ExecutionMode::Pull->value);
+        $policy = ConcurrencyPolicy::from($attributes['concurrency_policy'] ?? ConcurrencyPolicy::Parallel->value);
+        if ($mode === ExecutionMode::Reported && $policy === ConcurrencyPolicy::Queue) {
+            throw ValidationException::withMessages(['concurrency_policy' => 'A reported run starts at once, so it cannot wait its turn.']);
+        }
+
         $defaults = (array) config('runs.defaults', []);
         $modelClass = RunModels::run();
 
         try {
-            return DB::transaction(function () use ($attributes, $mode, $defaults, $modelClass) {
+            return DB::transaction(function () use ($attributes, $mode, $policy, $defaults, $modelClass) {
+                if (! empty($attributes['concurrency_key'])) {
+                    $this->applyPolicy($policy, $attributes);
+                }
+
                 $run = $modelClass::create([
                     ...$attributes,
                     'input' => $attributes['input'] ?? [],
                     'execution_mode' => $mode,
+                    'concurrency_policy' => $policy,
                     'status' => $mode === ExecutionMode::Reported ? RunStatus::Running : RunStatus::Queued,
                     'max_attempts' => $mode === ExecutionMode::Reported ? 1 : ($attributes['max_attempts'] ?? $defaults['max_attempts'] ?? 1),
                     'lease_seconds' => $attributes['lease_seconds'] ?? $defaults['lease_seconds'] ?? 90,
@@ -99,27 +119,39 @@ class RunService
         }
     }
 
-    /** Hand the oldest available pull run this runner may take to it, or null when there is none. */
-    public function claim(Runner $runner, ?array $types = null): ?StartedAttempt
+    /**
+     * Hand up to $limit available pull runs this runner may take to it,
+     * oldest first. Empty when there is nothing to do.
+     *
+     * @return array<int, StartedAttempt>
+     */
+    public function claim(Runner $runner, ?array $types = null, int $limit = 1, ?array $metadata = null): array
     {
         $accepted = $runner->types === null ? $types : array_values(array_intersect($types ?? $runner->types, $runner->types));
+        $claims = [];
+        $misses = 0;
 
-        for ($tries = 0; $tries < 5; $tries++) {
+        while (count($claims) < $limit && $misses < 5) {
             $query = RunModels::run()::query()
                 ->where('execution_mode', ExecutionMode::Pull)
                 ->where('status', RunStatus::Queued)
                 ->where('available_at', '<=', now())
                 ->beforeDeadline()
+                ->notBlocked()
                 ->when($accepted !== null, fn ($q) => $q->whereIn('type', $accepted))
                 ->orderBy('available_at')
                 ->orderBy('id');
 
             $candidate = $this->runners->scope($query, $runner)->first();
             if (! $candidate) {
-                return null;
+                break;
             }
 
-            $started = DB::transaction(function () use ($candidate, $runner) {
+            $started = DB::transaction(function () use ($candidate, $runner, $metadata) {
+                if ($this->isBlocked($candidate)) {
+                    return null;
+                }
+
                 $taken = RunModels::run()::query()
                     ->whereKey($candidate->getKey())
                     ->where('status', RunStatus::Queued)
@@ -127,22 +159,23 @@ class RunService
                     ->beforeDeadline()
                     ->update(['status' => RunStatus::Running]);
 
-                return $taken === 1 ? $this->startAttempt($candidate->fresh(), $runner, $candidate->lease_seconds) : null;
+                return $taken === 1 ? $this->startAttempt($candidate->fresh(), $runner, $candidate->lease_seconds, $metadata) : null;
             });
 
             if ($started) {
                 RunClaimed::dispatch($started->attempt);
-
-                return $started;
+                $claims[] = $started;
+            } else {
+                $misses++;
             }
         }
 
-        return null;
+        return $claims;
     }
 
-    public function heartbeat(RunAttempt $attempt, string $token, ?array $progress = null): RunAttempt
+    public function heartbeat(RunAttempt $attempt, string $token, ?array $progress = null, ?array $metadata = null): RunAttempt
     {
-        return DB::transaction(function () use ($attempt, $token, $progress) {
+        return DB::transaction(function () use ($attempt, $token, $progress, $metadata) {
             $attempt = $this->leased($attempt, $token);
             $run = $attempt->run;
             $extended = now()->addSeconds($run->lease_seconds);
@@ -153,6 +186,7 @@ class RunService
                     $attempt->lease_expires_at->max($extended),
                     $attempt->deadline_at,
                 ),
+                'metadata' => $this->merged($attempt->metadata, $metadata),
             ]);
 
             if ($progress !== null) {
@@ -175,7 +209,7 @@ class RunService
 
         $rows = array_map(fn (array $chunk) => [
             'run_id' => $attempt->run_id,
-            'attempt_id' => $attempt->id,
+            'attempt_id' => $attempt->getKey(),
             'sequence' => (int) $chunk['sequence'],
             'stream' => $chunk['stream'] ?? 'stdout',
             'content' => $chunk['content'],
@@ -186,6 +220,51 @@ class RunService
         return RunModels::logChunk()::query()->insertOrIgnore($rows);
     }
 
+    /**
+     * Declare the files an attempt will deliver. Completion is refused until
+     * each one has arrived. Declaring the same file again is allowed; a
+     * different file at a declared path is a conflict.
+     *
+     * @param  array<int, array{path: string, media_type: string, size: int, sha256: string, type?: string|null, metadata?: array|null}>  $files
+     * @return EloquentCollection<int, RunArtifact>
+     */
+    public function declareArtifacts(RunAttempt $attempt, string $token, array $files): EloquentCollection
+    {
+        return DB::transaction(function () use ($attempt, $token, $files) {
+            $attempt = $this->leased($attempt, $token);
+            $max = (int) config('runs.artifacts.max_bytes');
+
+            return new EloquentCollection(array_map(function (array $file) use ($attempt, $max) {
+                if ((int) $file['size'] > $max) {
+                    throw ValidationException::withMessages(['files' => "{$file['path']} is larger than artifacts may be."]);
+                }
+
+                $sha256 = strtolower($file['sha256']);
+                $existing = $this->artifactAt($attempt, $file['path']);
+                if ($existing) {
+                    if ($existing->sha256 !== $sha256 || $existing->size !== (int) $file['size'] || $existing->media_type !== $file['media_type']) {
+                        throw new RunConflict('artifact_exists', "This attempt already declared a different file at {$file['path']}.");
+                    }
+
+                    return $existing;
+                }
+
+                return RunModels::artifact()::create([
+                    'run_id' => $attempt->run_id,
+                    'attempt_id' => $attempt->getKey(),
+                    'path' => $file['path'],
+                    'path_hash' => hash('sha256', $file['path']),
+                    'type' => $file['type'] ?? null,
+                    'media_type' => $file['media_type'],
+                    'size' => (int) $file['size'],
+                    'sha256' => $sha256,
+                    'metadata' => $file['metadata'] ?? null,
+                ]);
+            }, array_values($files)));
+        });
+    }
+
+    /** Upload a file for an attempt. A declared file must match its declaration. */
     public function storeArtifact(
         RunAttempt $attempt,
         string $token,
@@ -207,13 +286,10 @@ class RunService
             throw ValidationException::withMessages(['sha256' => 'The file does not match its checksum.']);
         }
 
-        $pathHash = hash('sha256', $path);
-        $existing = RunModels::artifact()::query()
-            ->where('attempt_id', $attempt->id)
-            ->where('path_hash', $pathHash)
-            ->first();
-
-        if ($existing) {
+        if ($existing = $this->artifactAt($attempt, $path)) {
+            if ($existing->received_at === null) {
+                return $this->receiveArtifact($existing, $file->get());
+            }
             if ($existing->sha256 === $actual) {
                 return $existing;
             }
@@ -221,17 +297,13 @@ class RunService
             throw new RunConflict('artifact_exists', 'This attempt already stored a different file at that path.');
         }
 
-        $disk = (string) config('runs.artifacts.disk', 'local');
-        $directory = trim((string) config('runs.artifacts.prefix', 'runs'), '/')
-            .'/'.$attempt->run->public_id.'/'.$attempt->public_id;
-        // Keyed by content, so a racing upload of different bytes to the same path
-        // never overwrites a file an artifact row already vouches for.
-        $storageKey = Storage::disk($disk)->putFileAs($directory, $file, $pathHash.'-'.$actual);
+        $pathHash = hash('sha256', $path);
+        [$disk, $storageKey] = $this->put($attempt, $pathHash, $actual, $file);
 
         try {
             $artifact = RunModels::artifact()::create([
                 'run_id' => $attempt->run_id,
-                'attempt_id' => $attempt->id,
+                'attempt_id' => $attempt->getKey(),
                 'path' => $path,
                 'path_hash' => $pathHash,
                 'type' => $type,
@@ -244,12 +316,9 @@ class RunService
                 'metadata' => $metadata,
             ]);
         } catch (UniqueConstraintViolationException $e) {
-            $winner = RunModels::artifact()::query()
-                ->where('attempt_id', $attempt->id)
-                ->where('path_hash', $pathHash)
-                ->firstOrFail();
+            $winner = $this->artifactAt($attempt, $path);
 
-            if ($winner->sha256 === $actual) {
+            if ($winner?->sha256 === $actual) {
                 return $winner;
             }
 
@@ -263,9 +332,40 @@ class RunService
         return $artifact;
     }
 
-    public function complete(RunAttempt $attempt, string $token, array $result): Run
+    /**
+     * Store the bytes of a declared file. For hosts that receive uploads
+     * through their own routes; the contents must match the declaration.
+     */
+    public function receiveArtifact(RunArtifact $artifact, string $contents): RunArtifact
     {
-        return DB::transaction(function () use ($attempt, $token, $result) {
+        if (strlen($contents) !== $artifact->size || ! hash_equals($artifact->sha256, hash('sha256', $contents))) {
+            throw ValidationException::withMessages(['file' => 'The file does not match its declared size and checksum.']);
+        }
+
+        $attempt = $this->receiving($artifact);
+        if ($artifact->received_at !== null) {
+            return $artifact;
+        }
+
+        [$disk, $storageKey] = $this->put($attempt, $artifact->path_hash, $artifact->sha256, $contents);
+
+        return $this->markReceived($artifact, $disk, $storageKey);
+    }
+
+    /**
+     * Record that a declared file was stored by the host itself, for example
+     * uploaded straight to object storage. The host vouches for its contents.
+     */
+    public function markArtifactReceived(RunArtifact $artifact, string $disk, string $storageKey): RunArtifact
+    {
+        $this->receiving($artifact);
+
+        return $artifact->received_at !== null ? $artifact : $this->markReceived($artifact, $disk, $storageKey);
+    }
+
+    public function complete(RunAttempt $attempt, string $token, array $result, ?array $metadata = null): Run
+    {
+        return DB::transaction(function () use ($attempt, $token, $result, $metadata) {
             $attempt = $this->locked($attempt);
 
             if ($attempt->status === AttemptStatus::Succeeded) {
@@ -280,12 +380,18 @@ class RunService
             $attempt = $this->leased($attempt, $token);
             $run = $attempt->run;
 
+            $missing = $attempt->artifacts()->whereNull('received_at')->orderBy('path')->pluck('path');
+            if ($missing->isNotEmpty()) {
+                throw new RunConflict('artifacts_missing', 'Declared files have not arrived.', ['paths' => $missing->all()]);
+            }
+
             $rules = $this->types->get($run->type)->resultRules();
             Validator::make(['result' => $result], $this->prefix('result', $rules))->validate();
 
             $attempt->update([
                 'status' => AttemptStatus::Succeeded,
                 'result' => $result,
+                'metadata' => $this->merged($attempt->metadata, $metadata),
                 'finished_at' => now(),
                 'lease_expires_at' => null,
             ]);
@@ -293,13 +399,14 @@ class RunService
             $run->update([
                 'status' => RunStatus::Succeeded,
                 'result' => $result,
-                'accepted_attempt_id' => $attempt->id,
+                'accepted_attempt_id' => $attempt->getKey(),
                 'finished_at' => now(),
                 'error_code' => null,
                 'error_message' => null,
             ]);
 
             RunSettled::dispatch($run);
+            $this->releaseNext($run);
 
             return $run;
         });
@@ -309,9 +416,9 @@ class RunService
      * Record a failed attempt. The run is tried again when the error is
      * retryable and attempts remain; a run being cancelled settles as cancelled.
      */
-    public function fail(RunAttempt $attempt, string $token, string $errorCode, ?string $message = null, ?bool $retryable = null): Run
+    public function fail(RunAttempt $attempt, string $token, string $errorCode, ?string $message = null, ?bool $retryable = null, ?array $metadata = null): Run
     {
-        return DB::transaction(function () use ($attempt, $token, $errorCode, $message, $retryable) {
+        return DB::transaction(function () use ($attempt, $token, $errorCode, $message, $retryable, $metadata) {
             $attempt = $this->locked($attempt);
 
             if (in_array($attempt->status, [AttemptStatus::Failed, AttemptStatus::Cancelled], true)) {
@@ -328,6 +435,7 @@ class RunService
                 'status' => $cancelling ? AttemptStatus::Cancelled : AttemptStatus::Failed,
                 'error_code' => $errorCode,
                 'error_message' => $message,
+                'metadata' => $this->merged($attempt->metadata, $metadata),
                 'finished_at' => now(),
                 'lease_expires_at' => null,
             ]);
@@ -335,6 +443,87 @@ class RunService
             $retry = $retryable ?? $this->types->get($run->type)->isRetryable($errorCode);
 
             return $this->afterAttempt($run, $errorCode, $message, $retry, RunStatus::Failed);
+        });
+    }
+
+    /**
+     * Park the run until something outside it happens, such as a person
+     * answering. The attempt ends; a later attempt continues from the run's
+     * state. Waiting does not use up retries.
+     */
+    public function wait(
+        RunAttempt $attempt,
+        string $token,
+        string $reason,
+        ?array $state = null,
+        ?DateTimeInterface $resumeAt = null,
+        ?array $metadata = null,
+    ): Run {
+        return DB::transaction(function () use ($attempt, $token, $reason, $state, $resumeAt, $metadata) {
+            $attempt = $this->locked($attempt);
+
+            if ($attempt->status === AttemptStatus::Suspended) {
+                $this->assertToken($attempt, $token);
+
+                return $attempt->run;
+            }
+
+            $attempt = $this->leased($attempt, $token);
+            $run = RunModels::run()::query()->lockForUpdate()->findOrFail($attempt->run_id);
+
+            if ($run->execution_mode === ExecutionMode::Reported) {
+                throw new RunConflict('cannot_wait', 'A reported run cannot wait.');
+            }
+
+            if ($run->status === RunStatus::Cancelling) {
+                $attempt->update(['status' => AttemptStatus::Cancelled, 'finished_at' => now(), 'lease_expires_at' => null]);
+
+                return $this->afterAttempt($run, 'cancelled', null, false, RunStatus::Cancelled);
+            }
+
+            $attempt->update([
+                'status' => AttemptStatus::Suspended,
+                'metadata' => $this->merged($attempt->metadata, $metadata),
+                'finished_at' => now(),
+                'lease_expires_at' => null,
+            ]);
+
+            $run->update([
+                'status' => RunStatus::Waiting,
+                'waiting_on' => ['reason' => $reason],
+                'resume_at' => $resumeAt,
+                'state' => $state ?? $run->state,
+            ]);
+            RunWaiting::dispatch($run);
+
+            return $run;
+        });
+    }
+
+    /** Continue a waiting run. $data is merged into the run's state for the next attempt. */
+    public function resume(Run $run, array $data = []): Run
+    {
+        return DB::transaction(function () use ($run, $data) {
+            $run = RunModels::run()::query()->lockForUpdate()->findOrFail($run->getKey());
+
+            if ($run->status !== RunStatus::Waiting) {
+                throw new RunConflict('not_waiting', 'The run is not waiting.');
+            }
+
+            $run->update([
+                'status' => RunStatus::Queued,
+                'state' => [...($run->state ?? []), ...$data],
+                'waiting_on' => null,
+                'resume_at' => null,
+                'available_at' => now(),
+            ]);
+            RunResumed::dispatch($run);
+
+            if ($run->execution_mode === ExecutionMode::Queue) {
+                $this->dispatchQueued($run);
+            }
+
+            return $run;
         });
     }
 
@@ -367,16 +556,23 @@ class RunService
                 'status' => RunStatus::Cancelled,
                 'cancel_requested_at' => now(),
                 'finished_at' => now(),
+                'waiting_on' => null,
+                'resume_at' => null,
             ]);
-            RunModels::dispatch()::query()->where('run_id', $run->id)->delete();
+            RunModels::dispatch()::query()->where('run_id', $run->getKey())->delete();
             RunSettled::dispatch($run);
+            $this->releaseNext($run);
 
             return $run;
         });
     }
 
     /**
-     * @return array{expired_attempts: int, timed_out_runs: int, dispatched_runs: int}
+     * Expire attempts whose machine stopped renewing its lease, resume runs
+     * whose wait is over, time out runs past their deadline, and resend queue
+     * messages that never arrived. Schedule this every minute.
+     *
+     * @return array{expired_attempts: int, resumed_runs: int, timed_out_runs: int, dispatched_runs: int}
      */
     public function sweep(): array
     {
@@ -405,28 +601,49 @@ class RunService
             });
         }
 
+        $resumed = 0;
+        $due = RunModels::run()::query()
+            ->where('status', RunStatus::Waiting)
+            ->whereNotNull('resume_at')
+            ->where('resume_at', '<=', now())
+            ->beforeDeadline()
+            ->get();
+
+        foreach ($due as $run) {
+            try {
+                $this->resume($run);
+                $resumed++;
+            } catch (RunConflict) {
+                // Resumed or cancelled by someone else in the meantime.
+            }
+        }
+
         $timedOut = 0;
         $overdue = RunModels::run()::query()
-            ->where('status', RunStatus::Queued)
+            ->whereIn('status', [RunStatus::Queued, RunStatus::Waiting])
             ->whereNotNull('deadline_at')
             ->where('deadline_at', '<', now())
             ->get();
 
         foreach ($overdue as $run) {
-            $taken = RunModels::run()::query()
-                ->whereKey($run->getKey())
-                ->where('status', RunStatus::Queued)
-                ->update([
-                    'status' => RunStatus::TimedOut,
-                    'error_code' => 'deadline_passed',
-                    'finished_at' => now(),
-                ]);
+            DB::transaction(function () use ($run, &$timedOut) {
+                $taken = RunModels::run()::query()
+                    ->whereKey($run->getKey())
+                    ->whereIn('status', [RunStatus::Queued, RunStatus::Waiting])
+                    ->update([
+                        'status' => RunStatus::TimedOut,
+                        'error_code' => 'deadline_passed',
+                        'finished_at' => now(),
+                    ]);
 
-            if ($taken === 1) {
-                RunModels::dispatch()::query()->where('run_id', $run->id)->delete();
-                $timedOut++;
-                RunSettled::dispatch($run->fresh());
-            }
+                if ($taken === 1) {
+                    RunModels::dispatch()::query()->where('run_id', $run->getKey())->delete();
+                    $timedOut++;
+                    $settled = $run->fresh();
+                    RunSettled::dispatch($settled);
+                    $this->releaseNext($settled);
+                }
+            });
         }
 
         $dispatched = 0;
@@ -436,13 +653,17 @@ class RunService
             $dispatched += (int) $this->dispatchPending($id);
         }
 
-        return ['expired_attempts' => $expired, 'timed_out_runs' => $timedOut, 'dispatched_runs' => $dispatched];
+        return ['expired_attempts' => $expired, 'resumed_runs' => $resumed, 'timed_out_runs' => $timedOut, 'dispatched_runs' => $dispatched];
     }
 
-    /** Take a queued run for the Laravel queue. Null when another worker already has it. */
+    /** Take a queued run for the Laravel queue. Null when another worker has it or it must wait its turn. */
     public function startQueued(Run $run): ?StartedAttempt
     {
         return DB::transaction(function () use ($run) {
+            if ($this->isBlocked($run->fresh())) {
+                return null;
+            }
+
             $taken = RunModels::run()::query()
                 ->whereKey($run->getKey())
                 ->where('execution_mode', ExecutionMode::Queue)
@@ -455,13 +676,13 @@ class RunService
                 return null;
             }
             $started = $this->startAttempt($run->fresh(), new Runner('queue'), $run->attempt_timeout_seconds);
-            RunModels::dispatch()::query()->where('run_id', $run->id)->delete();
+            RunModels::dispatch()::query()->where('run_id', $run->getKey())->delete();
 
             return $started;
         });
     }
 
-    private function startAttempt(Run $run, ?Runner $runner, int $leaseSeconds): StartedAttempt
+    private function startAttempt(Run $run, ?Runner $runner, int $leaseSeconds, ?array $metadata = null): StartedAttempt
     {
         $token = Str::random(48);
         $number = $run->attempt_count + 1;
@@ -474,7 +695,7 @@ class RunService
         ]);
 
         $attempt = RunModels::attempt()::create([
-            'run_id' => $run->id,
+            'run_id' => $run->getKey(),
             'number' => $number,
             'status' => AttemptStatus::Running,
             'executor_type' => $runner?->type,
@@ -484,6 +705,7 @@ class RunService
             'lease_expires_at' => $this->earliest(now()->addSeconds($leaseSeconds), $deadline),
             'deadline_at' => $deadline,
             'started_at' => now(),
+            'metadata' => $metadata,
         ]);
 
         return new StartedAttempt($attempt, $token);
@@ -496,16 +718,20 @@ class RunService
 
         if ($run->status === RunStatus::Cancelling) {
             $run->update([...$error, 'status' => RunStatus::Cancelled, 'finished_at' => now()]);
+            RunModels::dispatch()::query()->where('run_id', $run->getKey())->delete();
             RunSettled::dispatch($run);
+            $this->releaseNext($run);
 
             return $run;
         }
 
+        $run->failure_count++;
+
         if ($retry && $run->canRetry()) {
             $backoff = array_values((array) config('runs.defaults.retry_backoff_seconds', [0]));
-            $delay = (int) ($backoff[min($run->attempt_count - 1, count($backoff) - 1)] ?? 0);
+            $delay = (int) ($backoff[min($run->failure_count - 1, count($backoff) - 1)] ?? 0);
 
-            $run->update([...$error, 'status' => RunStatus::Queued, 'available_at' => now()->addSeconds($delay)]);
+            $run->fill([...$error, 'status' => RunStatus::Queued, 'available_at' => now()->addSeconds($delay)])->save();
             RunRetryScheduled::dispatch($run);
 
             if ($run->execution_mode === ExecutionMode::Queue) {
@@ -515,16 +741,77 @@ class RunService
             return $run;
         }
 
-        $run->update([...$error, 'status' => $terminal, 'finished_at' => now()]);
-        RunModels::dispatch()::query()->where('run_id', $run->id)->delete();
+        $run->fill([...$error, 'status' => $terminal, 'finished_at' => now()])->save();
+        RunModels::dispatch()::query()->where('run_id', $run->getKey())->delete();
         RunSettled::dispatch($run);
+        $this->releaseNext($run);
 
         return $run;
     }
 
+    private function applyPolicy(ConcurrencyPolicy $policy, array $attributes): void
+    {
+        if (! in_array($policy, [ConcurrencyPolicy::Reject, ConcurrencyPolicy::Supersede], true)) {
+            return;
+        }
+
+        $active = RunModels::run()::query()
+            ->where('owner_type', $attributes['owner_type'])
+            ->where('owner_id', $attributes['owner_id'])
+            ->where('concurrency_key', $attributes['concurrency_key'])
+            ->whereIn('status', RunStatus::unfinished())
+            ->lockForUpdate()
+            ->get();
+
+        if ($active->isEmpty()) {
+            return;
+        }
+
+        if ($policy === ConcurrencyPolicy::Reject) {
+            throw new RunConflict('concurrency_busy', 'Another run with this concurrency key has not finished.');
+        }
+
+        foreach ($active as $run) {
+            if ($run->status !== RunStatus::Cancelling) {
+                $this->cancel($run);
+            }
+        }
+    }
+
+    private function isBlocked(Run $run): bool
+    {
+        return $run->concurrency_policy === ConcurrencyPolicy::Queue
+            && $run->concurrency_key !== null
+            && ! RunModels::run()::query()->whereKey($run->getKey())->notBlocked()->exists();
+    }
+
+    /** Hand the queue the next run that was waiting its turn behind $run. */
+    private function releaseNext(Run $run): void
+    {
+        if ($run->concurrency_key === null) {
+            return;
+        }
+
+        $next = RunModels::run()::query()
+            ->where('owner_type', $run->owner_type)
+            ->where('owner_id', $run->owner_id)
+            ->where('concurrency_key', $run->concurrency_key)
+            ->where('concurrency_policy', ConcurrencyPolicy::Queue)
+            ->where('execution_mode', ExecutionMode::Queue)
+            ->where('status', RunStatus::Queued)
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->first();
+
+        if ($next) {
+            RunModels::dispatch()::query()->updateOrCreate(['run_id' => $next->getKey()], ['next_dispatch_at' => now()]);
+            $this->dispatchQueued($next);
+        }
+    }
+
     private function dispatchQueued(Run $run): void
     {
-        $dispatch = RunModels::dispatch()::query()->firstOrCreate(['run_id' => $run->id], ['next_dispatch_at' => now()]);
+        $dispatch = RunModels::dispatch()::query()->firstOrCreate(['run_id' => $run->getKey()], ['next_dispatch_at' => now()]);
         DB::afterCommit(fn () => $this->dispatchPending($dispatch->id));
     }
 
@@ -561,7 +848,7 @@ class RunService
             return false;
         }
         try {
-            ExecuteRun::dispatch($run->id)->onConnection(config('runs.queue.connection'))
+            ExecuteRun::dispatch($run->getKey())->onConnection(config('runs.queue.connection'))
                 ->onQueue(config('runs.queue.name'))->delay($run->available_at);
         } catch (Throwable $exception) {
             RunModels::dispatch()::query()->whereKey($id)->where('dispatch_token', $token)->update([
@@ -574,6 +861,62 @@ class RunService
         }
 
         return true;
+    }
+
+    private function artifactAt(RunAttempt $attempt, string $path): ?RunArtifact
+    {
+        return RunModels::artifact()::query()
+            ->where('attempt_id', $attempt->getKey())
+            ->where('path_hash', hash('sha256', $path))
+            ->first();
+    }
+
+    /** The attempt a declared file belongs to, while it may still receive files. */
+    private function receiving(RunArtifact $artifact): RunAttempt
+    {
+        $attempt = $artifact->attempt;
+        if ($attempt->status !== AttemptStatus::Running || ! $attempt->lease_expires_at?->isFuture()) {
+            throw new RunConflict('lease_lost', 'This attempt no longer holds the run.');
+        }
+
+        return $attempt;
+    }
+
+    /**
+     * Store bytes under a key that includes their checksum, so a racing write
+     * of different bytes never overwrites a file an artifact row vouches for.
+     *
+     * @return array{0: string, 1: string}
+     */
+    private function put(RunAttempt $attempt, string $pathHash, string $sha256, UploadedFile|string $contents): array
+    {
+        $disk = (string) config('runs.artifacts.disk', 'local');
+        $directory = trim((string) config('runs.artifacts.prefix', 'runs'), '/')
+            .'/'.$attempt->run->public_id.'/'.$attempt->public_id;
+        $name = $pathHash.'-'.$sha256;
+
+        if ($contents instanceof UploadedFile) {
+            return [$disk, Storage::disk($disk)->putFileAs($directory, $contents, $name)];
+        }
+
+        Storage::disk($disk)->put("{$directory}/{$name}", $contents);
+
+        return [$disk, "{$directory}/{$name}"];
+    }
+
+    private function markReceived(RunArtifact $artifact, string $disk, string $storageKey): RunArtifact
+    {
+        $taken = RunModels::artifact()::query()
+            ->whereKey($artifact->getKey())
+            ->whereNull('received_at')
+            ->update(['disk' => $disk, 'storage_key' => $storageKey, 'received_at' => now()]);
+
+        $artifact = $artifact->fresh();
+        if ($taken === 1) {
+            ArtifactReceived::dispatch($artifact);
+        }
+
+        return $artifact;
     }
 
     private function assertFingerprint(Run $run, ?string $fingerprint): void
@@ -620,6 +963,11 @@ class RunService
             ->where('owner_id', $attributes['owner_id'])
             ->where('idempotency_key', $attributes['idempotency_key'])
             ->first();
+    }
+
+    private function merged(?array $current, ?array $added): ?array
+    {
+        return $added === null ? $current : [...($current ?? []), ...$added];
     }
 
     private function prefix(string $key, array $rules): array
