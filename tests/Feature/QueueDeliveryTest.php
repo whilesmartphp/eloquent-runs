@@ -136,19 +136,6 @@ class QueueDeliveryTest extends TestCase
     }
 
     #[Test]
-    public function upgrading_recovers_existing_queued_runs(): void
-    {
-        $id = $this->queued();
-        $this->artisan('queue:clear', ['connection' => 'delivery', '--force' => true])->assertSuccessful();
-        $this->artisan('migrate:rollback', ['--step' => 1])->assertSuccessful();
-        $this->artisan('migrate')->assertSuccessful();
-        $this->assertDatabaseCount('work_run_dispatches', 1);
-        $this->artisan('runs:sweep')->assertSuccessful();
-        $this->work();
-        $this->getJson('/api/runs/'.$id)->assertOk()->assertJsonPath('data.status', 'succeeded');
-    }
-
-    #[Test]
     public function cancelled_and_overdue_runs_are_not_redelivered(): void
     {
         $cancelled = $this->queued();

@@ -65,7 +65,7 @@ If a handler returns a result that fails its type's validation, the attempt fail
 
 ## Queue delivery
 
-Queue delivery is recorded in the same database transaction as the run or retry. The message is sent after commit. A failed push leaves the run queued, and `runs:sweep` tries delivery again. The migration also records delivery for existing queued runs.
+Queue delivery is recorded in the same database transaction as the run or retry. The message is sent after commit. A failed push leaves the run queued, and `runs:sweep` tries delivery again.
 
 Configure recovery in `runs.queue`:
 

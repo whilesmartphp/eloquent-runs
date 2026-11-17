@@ -31,6 +31,7 @@ return new class extends Migration
             $table->json('progress')->nullable();
             $table->json('metadata')->nullable();
             $table->string('idempotency_key', 200)->nullable();
+            $table->string('request_fingerprint')->nullable();
 
             $table->unsignedInteger('attempt_count')->default(0);
             $table->unsignedInteger('max_attempts')->default(1);
@@ -54,6 +55,16 @@ return new class extends Migration
             $table->index(['trigger_type', 'trigger_id']);
             $table->index(['execution_mode', 'status', 'available_at']);
             $table->index(['status', 'deadline_at']);
+        });
+
+        Schema::create(config('runs.dispatches_table', 'work_run_dispatches'), function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('run_id')->unique()->constrained(config('runs.runs_table', 'work_runs'))->cascadeOnDelete();
+            $table->timestamp('next_dispatch_at')->index();
+            $table->uuid('dispatch_token')->nullable();
+            $table->unsignedInteger('dispatch_attempts')->default(0);
+            $table->string('last_error')->nullable();
+            $table->timestamps();
         });
 
         Schema::create(config('runs.attempts_table', 'work_run_attempts'), function (Blueprint $table) {
@@ -122,6 +133,7 @@ return new class extends Migration
         Schema::dropIfExists(config('runs.log_chunks_table', 'work_run_log_chunks'));
         Schema::dropIfExists(config('runs.artifacts_table', 'work_run_artifacts'));
         Schema::dropIfExists(config('runs.attempts_table', 'work_run_attempts'));
+        Schema::dropIfExists(config('runs.dispatches_table', 'work_run_dispatches'));
         Schema::dropIfExists(config('runs.runs_table', 'work_runs'));
     }
 };
