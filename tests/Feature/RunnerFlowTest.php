@@ -202,7 +202,7 @@ class RunnerFlowTest extends TestCase
 
         $this->postJson("/api/runs/{$runId}/cancel")->assertOk()->assertJsonPath('data.status', 'cancelling');
         $this->asAttempt($token)->postJson("/api/runner/attempts/{$attempt}/heartbeat")->assertJsonPath('data.cancel_requested', true);
-        $this->asAttempt($token)->postJson("/api/runner/attempts/{$attempt}/fail", ['error_code' => 'cancelled', 'retryable' => true])
+        $this->asAttempt($token)->postJson("/api/runner/attempts/{$attempt}/fail", ['error_code' => 'cancelled'])
             ->assertJsonPath('data.status', 'cancelled');
     }
 

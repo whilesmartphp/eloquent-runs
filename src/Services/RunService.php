@@ -100,6 +100,7 @@ class RunService
                 ->where('execution_mode', ExecutionMode::Pull)
                 ->where('status', RunStatus::Queued)
                 ->where('available_at', '<=', now())
+                ->beforeDeadline()
                 ->when($accepted !== null, fn ($q) => $q->whereIn('type', $accepted))
                 ->orderBy('available_at')
                 ->orderBy('id');
@@ -113,6 +114,7 @@ class RunService
                 $taken = RunModels::run()::query()
                     ->whereKey($candidate->getKey())
                     ->where('status', RunStatus::Queued)
+                    ->beforeDeadline()
                     ->update(['status' => RunStatus::Running]);
 
                 return $taken === 1 ? $this->startAttempt($candidate->fresh(), $runner, $candidate->lease_seconds) : null;
@@ -212,22 +214,39 @@ class RunService
         $disk = (string) config('runs.artifacts.disk', 'local');
         $directory = trim((string) config('runs.artifacts.prefix', 'runs'), '/')
             .'/'.$attempt->run->public_id.'/'.$attempt->public_id;
-        $storageKey = Storage::disk($disk)->putFileAs($directory, $file, $pathHash);
+        // Keyed by content, so a racing upload of different bytes to the same path
+        // never overwrites a file an artifact row already vouches for.
+        $storageKey = Storage::disk($disk)->putFileAs($directory, $file, $pathHash.'-'.$actual);
 
-        $artifact = RunModels::artifact()::create([
-            'run_id' => $attempt->run_id,
-            'attempt_id' => $attempt->id,
-            'path' => $path,
-            'path_hash' => $pathHash,
-            'type' => $type,
-            'media_type' => $file->getMimeType() ?: 'application/octet-stream',
-            'size' => $size,
-            'sha256' => $actual,
-            'disk' => $disk,
-            'storage_key' => $storageKey,
-            'received_at' => now(),
-            'metadata' => $metadata,
-        ]);
+        try {
+            $artifact = RunModels::artifact()::create([
+                'run_id' => $attempt->run_id,
+                'attempt_id' => $attempt->id,
+                'path' => $path,
+                'path_hash' => $pathHash,
+                'type' => $type,
+                'media_type' => $file->getMimeType() ?: 'application/octet-stream',
+                'size' => $size,
+                'sha256' => $actual,
+                'disk' => $disk,
+                'storage_key' => $storageKey,
+                'received_at' => now(),
+                'metadata' => $metadata,
+            ]);
+        } catch (UniqueConstraintViolationException $e) {
+            $winner = RunModels::artifact()::query()
+                ->where('attempt_id', $attempt->id)
+                ->where('path_hash', $pathHash)
+                ->firstOrFail();
+
+            if ($winner->sha256 === $actual) {
+                return $winner;
+            }
+
+            Storage::disk($disk)->delete($storageKey);
+
+            throw new RunConflict('artifact_exists', 'This attempt already stored a different file at that path.');
+        }
 
         ArtifactReceived::dispatch($artifact);
 
@@ -412,6 +431,7 @@ class RunService
                 ->whereKey($run->getKey())
                 ->where('execution_mode', ExecutionMode::Queue)
                 ->where('status', RunStatus::Queued)
+                ->beforeDeadline()
                 ->update(['status' => RunStatus::Running]);
 
             return $taken === 1

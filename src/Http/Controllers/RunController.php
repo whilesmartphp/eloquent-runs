@@ -92,7 +92,7 @@ class RunController extends Controller
         return $this->respond($this->resource('attempt')::collection($record->attempts()->orderBy('number')->get()));
     }
 
-    /** Artifacts of the accepted attempt, or of every attempt with ?all=1. */
+    /** Artifacts of the accepted attempt (none until one is accepted), or of every attempt with ?all=1. */
     public function artifacts(Request $request, string $run): JsonResponse
     {
         $record = $this->findRun($run);
@@ -100,7 +100,7 @@ class RunController extends Controller
 
         $artifacts = $record->artifacts()
             ->with('attempt')
-            ->when(! $request->boolean('all') && $record->accepted_attempt_id, fn ($q) => $q->where('attempt_id', $record->accepted_attempt_id))
+            ->when(! $request->boolean('all'), fn ($q) => $q->where('attempt_id', $record->accepted_attempt_id))
             ->orderBy('id')
             ->get();
 

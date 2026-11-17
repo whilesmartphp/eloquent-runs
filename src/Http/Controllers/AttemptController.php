@@ -85,7 +85,6 @@ class AttemptController extends Controller
         $validated = $request->validate([
             'error_code' => ['required', 'string', 'max:100'],
             'error_message' => ['nullable', 'string', 'max:5000'],
-            'retryable' => ['nullable', 'boolean'],
         ]);
 
         $run = $this->runs->fail(
@@ -93,7 +92,6 @@ class AttemptController extends Controller
             $this->token($request),
             $validated['error_code'],
             $validated['error_message'] ?? null,
-            $validated['retryable'] ?? null,
         );
 
         return $this->respond(new ($this->resource('run'))($run));

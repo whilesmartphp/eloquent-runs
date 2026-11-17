@@ -83,7 +83,7 @@ User routes use `route_middleware` (default `api`, `auth:sanctum`) under `route_
 | GET | `/runs/{run}` | Show a run |
 | POST | `/runs/{run}/cancel` | Cancel a queued run at once, or ask a running machine to stop |
 | GET | `/runs/{run}/attempts` | List attempts |
-| GET | `/runs/{run}/artifacts` | Files of the accepted attempt; `?all=1` for every attempt |
+| GET | `/runs/{run}/artifacts` | Files of the accepted attempt, so none before the run succeeds; `?all=1` for every attempt |
 | GET | `/runs/{run}/artifacts/{artifact}` | Download a file |
 | GET | `/runs/{run}/logs` | Log lines after the `?after` cursor |
 
@@ -96,7 +96,7 @@ Runner routes use `runner_route_middleware` (default `api`) under `runner_route_
 | POST | `/attempts/{attempt}/logs` | Append numbered log lines; a resent number is skipped |
 | POST | `/attempts/{attempt}/artifacts` | Upload a file with its path and optional checksum |
 | POST | `/attempts/{attempt}/complete` | Settle the run with a result |
-| POST | `/attempts/{attempt}/fail` | Fail the attempt; the run retries if its type allows it and attempts remain |
+| POST | `/attempts/{attempt}/fail` | Fail the attempt; the run retries if its type allows the error code, attempts remain and its deadline has not passed |
 
 A request that no longer matches the run's state, such as completing after the lease expired, gets `409` with a `code`.
 

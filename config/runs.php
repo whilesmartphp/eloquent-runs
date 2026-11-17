@@ -18,8 +18,9 @@ return [
     'route_prefix' => env('RUNS_ROUTE_PREFIX', 'api'),
     'route_middleware' => ['api', 'auth:sanctum'],
 
-    // Routes machines use: claiming work, and everything an attempt does with
-    // its lease token. Off until the host binds a RunnerAuthorizer.
+    // The claim route, where machines take queued work. Off until the host binds
+    // a RunnerAuthorizer. Attempt routes stay on with the other routes: they are
+    // authenticated by lease token and reported runs upload through them.
     'register_runner_routes' => env('RUNS_REGISTER_RUNNER_ROUTES', false),
     'runner_route_prefix' => env('RUNS_RUNNER_ROUTE_PREFIX', 'api/runner'),
     'runner_route_middleware' => ['api'],

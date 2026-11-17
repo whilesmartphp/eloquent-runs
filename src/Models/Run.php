@@ -2,6 +2,7 @@
 
 namespace Whilesmart\Runs\Models;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -87,7 +88,13 @@ class Run extends Model
     {
         return $this->execution_mode !== ExecutionMode::Reported
             && $this->cancel_requested_at === null
-            && $this->attempt_count < $this->max_attempts;
+            && $this->attempt_count < $this->max_attempts
+            && ($this->deadline_at === null || $this->deadline_at->isFuture());
+    }
+
+    public function scopeBeforeDeadline(Builder $query): Builder
+    {
+        return $query->where(fn ($q) => $q->whereNull('deadline_at')->orWhere('deadline_at', '>', now()));
     }
 
     protected static function newFactory(): RunFactory
