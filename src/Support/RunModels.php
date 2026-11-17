@@ -5,6 +5,7 @@ namespace Whilesmart\Runs\Support;
 use Whilesmart\Runs\Models\Run;
 use Whilesmart\Runs\Models\RunArtifact;
 use Whilesmart\Runs\Models\RunAttempt;
+use Whilesmart\Runs\Models\RunDispatch;
 use Whilesmart\Runs\Models\RunLogChunk;
 
 class RunModels
@@ -31,5 +32,10 @@ class RunModels
     public static function logChunk(): string
     {
         return config('runs.models.log_chunk', RunLogChunk::class);
+    }
+
+    public static function dispatch(): string
+    {
+        return config('runs.models.dispatch', RunDispatch::class);
     }
 }

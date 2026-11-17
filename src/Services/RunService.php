@@ -10,6 +10,7 @@ use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
+use Throwable;
 use Whilesmart\Runs\Contracts\RunnerAuthorizer;
 use Whilesmart\Runs\Enums\AttemptStatus;
 use Whilesmart\Runs\Enums\ExecutionMode;
@@ -47,9 +48,13 @@ class RunService
     public function create(array $attributes): CreatedRun
     {
         $type = $this->types->get($attributes['type']);
+        Validator::make($attributes, ['request_fingerprint' => ['nullable', 'string', 'max:255']])->validate();
         Validator::make(['input' => $attributes['input'] ?? []], $this->prefix('input', $type->inputRules()))->validate();
 
         if ($existing = $this->findByIdempotencyKey($attributes)) {
+            $this->assertFingerprint($existing, $attributes['request_fingerprint'] ?? null);
+            $this->ensureQueueDelivery($existing);
+
             return new CreatedRun($existing, false);
         }
 
@@ -85,6 +90,10 @@ class RunService
             });
         } catch (UniqueConstraintViolationException $e) {
             $existing = $this->findByIdempotencyKey($attributes);
+            if ($existing) {
+                $this->assertFingerprint($existing, $attributes['request_fingerprint'] ?? null);
+                $this->ensureQueueDelivery($existing);
+            }
 
             return $existing ? new CreatedRun($existing, false) : throw $e;
         }
@@ -114,6 +123,7 @@ class RunService
                 $taken = RunModels::run()::query()
                     ->whereKey($candidate->getKey())
                     ->where('status', RunStatus::Queued)
+                    ->where('available_at', '<=', now())
                     ->beforeDeadline()
                     ->update(['status' => RunStatus::Running]);
 
@@ -358,6 +368,7 @@ class RunService
                 'cancel_requested_at' => now(),
                 'finished_at' => now(),
             ]);
+            RunModels::dispatch()::query()->where('run_id', $run->id)->delete();
             RunSettled::dispatch($run);
 
             return $run;
@@ -365,10 +376,7 @@ class RunService
     }
 
     /**
-     * Expire attempts whose machine stopped renewing its lease, and time out
-     * queued runs past their deadline. Schedule this every minute.
-     *
-     * @return array{expired_attempts: int, timed_out_runs: int}
+     * @return array{expired_attempts: int, timed_out_runs: int, dispatched_runs: int}
      */
     public function sweep(): array
     {
@@ -415,12 +423,20 @@ class RunService
                 ]);
 
             if ($taken === 1) {
+                RunModels::dispatch()::query()->where('run_id', $run->id)->delete();
                 $timedOut++;
                 RunSettled::dispatch($run->fresh());
             }
         }
 
-        return ['expired_attempts' => $expired, 'timed_out_runs' => $timedOut];
+        $dispatched = 0;
+        $pending = RunModels::dispatch()::query()->where('next_dispatch_at', '<=', now())
+            ->orderBy('id')->limit(max(1, min(1000, (int) config('runs.queue.recovery_batch_size', 100))))->pluck('id');
+        foreach ($pending as $id) {
+            $dispatched += (int) $this->dispatchPending($id);
+        }
+
+        return ['expired_attempts' => $expired, 'timed_out_runs' => $timedOut, 'dispatched_runs' => $dispatched];
     }
 
     /** Take a queued run for the Laravel queue. Null when another worker already has it. */
@@ -431,12 +447,17 @@ class RunService
                 ->whereKey($run->getKey())
                 ->where('execution_mode', ExecutionMode::Queue)
                 ->where('status', RunStatus::Queued)
+                ->where('available_at', '<=', now())
                 ->beforeDeadline()
                 ->update(['status' => RunStatus::Running]);
 
-            return $taken === 1
-                ? $this->startAttempt($run->fresh(), new Runner('queue'), $run->attempt_timeout_seconds)
-                : null;
+            if ($taken !== 1) {
+                return null;
+            }
+            $started = $this->startAttempt($run->fresh(), new Runner('queue'), $run->attempt_timeout_seconds);
+            RunModels::dispatch()::query()->where('run_id', $run->id)->delete();
+
+            return $started;
         });
     }
 
@@ -495,6 +516,7 @@ class RunService
         }
 
         $run->update([...$error, 'status' => $terminal, 'finished_at' => now()]);
+        RunModels::dispatch()::query()->where('run_id', $run->id)->delete();
         RunSettled::dispatch($run);
 
         return $run;
@@ -502,11 +524,64 @@ class RunService
 
     private function dispatchQueued(Run $run): void
     {
-        ExecuteRun::dispatch($run->id)
-            ->onConnection(config('runs.queue.connection'))
-            ->onQueue(config('runs.queue.name'))
-            ->delay($run->available_at)
-            ->afterCommit();
+        $dispatch = RunModels::dispatch()::query()->firstOrCreate(['run_id' => $run->id], ['next_dispatch_at' => now()]);
+        DB::afterCommit(fn () => $this->dispatchPending($dispatch->id));
+    }
+
+    private function ensureQueueDelivery(Run $run): void
+    {
+        if ($run->execution_mode === ExecutionMode::Queue && $run->status === RunStatus::Queued) {
+            $this->dispatchQueued($run);
+        }
+    }
+
+    private function dispatchPending(int $id): bool
+    {
+        $dispatch = RunModels::dispatch()::query()->find($id);
+        if (! $dispatch) {
+            return false;
+        }
+        $run = $dispatch->run;
+        if (! $run || $run->execution_mode !== ExecutionMode::Queue || $run->status !== RunStatus::Queued) {
+            $dispatch->delete();
+
+            return false;
+        }
+        if ($run->deadline_at !== null && ! $run->deadline_at->isFuture()) {
+            return false;
+        }
+        $token = (string) Str::uuid();
+        $next = $run->available_at?->isFuture() ? $run->available_at->copy() : now();
+        $taken = RunModels::dispatch()::query()->whereKey($id)->where('next_dispatch_at', '<=', now())->update([
+            'dispatch_token' => $token,
+            'next_dispatch_at' => $next->addSeconds(max(1, (int) config('runs.queue.redispatch_after_seconds', 300))),
+            'dispatch_attempts' => DB::raw('dispatch_attempts + 1'),
+        ]);
+        if ($taken !== 1) {
+            return false;
+        }
+        try {
+            ExecuteRun::dispatch($run->id)->onConnection(config('runs.queue.connection'))
+                ->onQueue(config('runs.queue.name'))->delay($run->available_at);
+        } catch (Throwable $exception) {
+            RunModels::dispatch()::query()->whereKey($id)->where('dispatch_token', $token)->update([
+                'last_error' => $exception::class,
+                'next_dispatch_at' => now()->addSeconds(max(1, (int) config('runs.queue.dispatch_retry_seconds', 30))),
+            ]);
+            report($exception);
+
+            return false;
+        }
+
+        return true;
+    }
+
+    private function assertFingerprint(Run $run, ?string $fingerprint): void
+    {
+        if (($run->request_fingerprint !== null || $fingerprint !== null)
+            && ($run->request_fingerprint === null || $fingerprint === null || ! hash_equals($run->request_fingerprint, $fingerprint))) {
+            throw new RunConflict('idempotency_conflict', 'This idempotency key was used for a different request.');
+        }
     }
 
     private function locked(RunAttempt $attempt): RunAttempt

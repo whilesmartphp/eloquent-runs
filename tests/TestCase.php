@@ -2,10 +2,11 @@
 
 namespace Tests;
 
-use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Foundation\Testing\DatabaseMigrations;
 use Illuminate\Testing\TestResponse;
 use Orchestra\Testbench\TestCase as BaseTestCase;
 use Tests\Fixtures\AddNumbersType;
+use Tests\Fixtures\QueueTestServiceProvider;
 use Tests\Fixtures\ScreenshotType;
 use Tests\Fixtures\TokenRunnerAuthorizer;
 use Whilesmart\OwnerAccess\OwnerAccessServiceProvider;
@@ -13,26 +14,29 @@ use Whilesmart\Runs\RunsServiceProvider;
 
 abstract class TestCase extends BaseTestCase
 {
-    use RefreshDatabase;
+    use DatabaseMigrations;
 
     protected const OWNER = 'App\\Models\\Workspace';
-
-    protected function defineDatabaseMigrations(): void
-    {
-        $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
-    }
 
     protected function getPackageProviders($app): array
     {
         return [
             OwnerAccessServiceProvider::class,
             RunsServiceProvider::class,
+            QueueTestServiceProvider::class,
         ];
     }
 
     protected function getEnvironmentSetUp($app): void
     {
+        if (env('DB_CONNECTION') === 'mysql' && ! str_ends_with((string) env('DB_DATABASE'), '_tests')) {
+            throw new \RuntimeException('MySQL tests require a dedicated database ending in _tests.');
+        }
+        if (env('DB_CONNECTION') === 'mysql') {
+            $app['config']->set('database.default', 'mysql');
+        }
         $app['config']->set('queue.default', 'sync');
+        $app['config']->set('cache.default', 'array');
         $app['config']->set('runs.route_middleware', ['api']);
         $app['config']->set('runs.register_runner_routes', true);
         $app['config']->set('runs.runner_authorizer', TokenRunnerAuthorizer::class);

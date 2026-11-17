@@ -6,8 +6,10 @@ use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Validation\ValidationException;
 use Throwable;
 use Whilesmart\Runs\Contracts\HandlesRun;
+use Whilesmart\Runs\Exceptions\RunConflict;
 use Whilesmart\Runs\Exceptions\RunFailed;
 use Whilesmart\Runs\Services\RunService;
 use Whilesmart\Runs\Support\RunModels;
@@ -32,26 +34,34 @@ class ExecuteRun implements ShouldQueue
             return;
         }
 
-        $handler = $types->get($run->type);
-        if (! $handler instanceof HandlesRun) {
-            $runs->fail($started->attempt, $started->leaseToken, 'no_handler', "Run type [{$run->type}] cannot run on the queue.", false);
-
-            return;
-        }
-
         try {
-            $result = $handler->handle($run->fresh(), $started->attempt);
-        } catch (RunFailed $e) {
-            $runs->fail($started->attempt, $started->leaseToken, $e->errorCode, $e->getMessage());
+            $handler = $types->get($run->type);
+            if (! $handler instanceof HandlesRun) {
+                $runs->fail($started->attempt, $started->leaseToken, 'no_handler', "Run type [{$run->type}] cannot run on the queue.", false);
 
-            return;
-        } catch (Throwable $e) {
-            report($e);
-            $runs->fail($started->attempt, $started->leaseToken, 'exception', $e->getMessage());
+                return;
+            }
+            try {
+                $result = $handler->handle($run->fresh(), $started->attempt);
+            } catch (RunFailed $e) {
+                $runs->fail($started->attempt, $started->leaseToken, $e->errorCode, $e->getMessage());
 
-            return;
+                return;
+            } catch (Throwable $e) {
+                report($e);
+                $runs->fail($started->attempt, $started->leaseToken, 'exception', $e->getMessage());
+
+                return;
+            }
+            try {
+                $runs->complete($started->attempt, $started->leaseToken, $result);
+            } catch (ValidationException) {
+                $runs->fail($started->attempt, $started->leaseToken, 'invalid_result', 'The result did not match the run type.');
+            }
+        } catch (RunConflict $exception) {
+            if ($exception->errorCode !== 'lease_lost') {
+                throw $exception;
+            }
         }
-
-        $runs->complete($started->attempt, $started->leaseToken, $result);
     }
 }
