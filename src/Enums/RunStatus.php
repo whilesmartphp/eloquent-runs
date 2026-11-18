@@ -6,6 +6,7 @@ enum RunStatus: string
 {
     case Queued = 'queued';
     case Running = 'running';
+    case Waiting = 'waiting';
     case Cancelling = 'cancelling';
     case Succeeded = 'succeeded';
     case Failed = 'failed';
@@ -15,6 +16,12 @@ enum RunStatus: string
     public static function values(): array
     {
         return array_column(self::cases(), 'value');
+    }
+
+    /** Statuses that hold a concurrency key. */
+    public static function unfinished(): array
+    {
+        return [self::Queued, self::Running, self::Waiting, self::Cancelling];
     }
 
     public function isFinished(): bool

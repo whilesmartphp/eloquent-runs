@@ -6,6 +6,8 @@ use Illuminate\Foundation\Testing\DatabaseMigrations;
 use Illuminate\Testing\TestResponse;
 use Orchestra\Testbench\TestCase as BaseTestCase;
 use Tests\Fixtures\AddNumbersType;
+use Tests\Fixtures\AskType;
+use Tests\Fixtures\Owners;
 use Tests\Fixtures\QueueTestServiceProvider;
 use Tests\Fixtures\ScreenshotType;
 use Tests\Fixtures\TokenRunnerAuthorizer;
@@ -29,11 +31,12 @@ abstract class TestCase extends BaseTestCase
 
     protected function getEnvironmentSetUp($app): void
     {
-        if (env('DB_CONNECTION') === 'mysql' && ! str_ends_with((string) env('DB_DATABASE'), '_tests')) {
-            throw new \RuntimeException('MySQL tests require a dedicated database ending in _tests.');
+        $server = in_array(env('DB_CONNECTION'), ['mysql', 'pgsql'], true) ? env('DB_CONNECTION') : null;
+        if ($server && ! str_ends_with((string) env('DB_DATABASE'), '_tests')) {
+            throw new \RuntimeException('Database server tests require a dedicated database ending in _tests.');
         }
-        if (env('DB_CONNECTION') === 'mysql') {
-            $app['config']->set('database.default', 'mysql');
+        if ($server) {
+            $app['config']->set('database.default', $server);
         }
         $app['config']->set('queue.default', 'sync');
         $app['config']->set('cache.default', 'array');
@@ -44,6 +47,7 @@ abstract class TestCase extends BaseTestCase
         $app['config']->set('runs.types', [
             'screenshot' => ScreenshotType::class,
             'add' => AddNumbersType::class,
+            'ask' => AskType::class,
         ]);
     }
 
@@ -55,6 +59,7 @@ abstract class TestCase extends BaseTestCase
             'type' => 'screenshot',
             'input' => ['url' => 'https://example.com'],
             ...$overrides,
+            'owner_id' => Owners::key($overrides['owner_id'] ?? 1),
         ]);
     }
 

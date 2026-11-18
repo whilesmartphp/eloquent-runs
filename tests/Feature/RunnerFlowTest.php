@@ -21,12 +21,12 @@ class RunnerFlowTest extends TestCase
         $runId = $this->createRun()->json('data.run.id');
 
         $claim = $this->claim()->assertOk()
-            ->assertJsonPath('data.run.id', $runId)
-            ->assertJsonPath('data.run.status', 'running')
-            ->assertJsonPath('data.attempt.number', 1)
-            ->assertJsonPath('data.attempt.executor_name', 'runner-1');
-        $attempt = $claim->json('data.attempt.id');
-        $token = $claim->json('data.lease_token');
+            ->assertJsonPath('data.claims.0.run.id', $runId)
+            ->assertJsonPath('data.claims.0.run.status', 'running')
+            ->assertJsonPath('data.claims.0.attempt.number', 1)
+            ->assertJsonPath('data.claims.0.attempt.executor_name', 'runner-1');
+        $attempt = $claim->json('data.claims.0.attempt.id');
+        $token = $claim->json('data.claims.0.lease_token');
 
         $this->claim()->assertNoContent();
 
@@ -88,7 +88,7 @@ class RunnerFlowTest extends TestCase
     public function a_wrong_or_missing_token_is_refused(): void
     {
         $this->createRun();
-        $attempt = $this->claim()->json('data.attempt.id');
+        $attempt = $this->claim()->json('data.claims.0.attempt.id');
 
         $this->postJson("/api/runner/attempts/{$attempt}/complete", ['result' => ['images' => 1]])
             ->assertUnauthorized()->assertJsonPath('code', 'invalid_token');
@@ -102,8 +102,8 @@ class RunnerFlowTest extends TestCase
         $this->createRun();
         $claim = $this->claim();
 
-        $this->asAttempt($claim->json('data.lease_token'))
-            ->postJson('/api/runner/attempts/'.$claim->json('data.attempt.id').'/complete', ['result' => ['images' => 0]])
+        $this->asAttempt($claim->json('data.claims.0.lease_token'))
+            ->postJson('/api/runner/attempts/'.$claim->json('data.claims.0.attempt.id').'/complete', ['result' => ['images' => 0]])
             ->assertUnprocessable()
             ->assertJsonValidationErrors('result.images');
     }
@@ -114,7 +114,7 @@ class RunnerFlowTest extends TestCase
         $this->createRun();
         $claim = $this->claim();
 
-        $this->asAttempt($claim->json('data.lease_token'))->post('/api/runner/attempts/'.$claim->json('data.attempt.id').'/artifacts', [
+        $this->asAttempt($claim->json('data.claims.0.lease_token'))->post('/api/runner/attempts/'.$claim->json('data.claims.0.attempt.id').'/artifacts', [
             'file' => UploadedFile::fake()->createWithContent('a.png', 'bytes'),
             'path' => 'a.png',
             'sha256' => str_repeat('0', 64),
@@ -134,14 +134,14 @@ class RunnerFlowTest extends TestCase
 
         $this->getJson("/api/runs/{$runId}")->assertJsonPath('data.status', 'queued')->assertJsonPath('data.error_code', 'lease_expired');
 
-        $second = $this->claim()->assertOk()->assertJsonPath('data.attempt.number', 2);
+        $second = $this->claim()->assertOk()->assertJsonPath('data.claims.0.attempt.number', 2);
 
-        $this->asAttempt($first->json('data.lease_token'))
-            ->postJson('/api/runner/attempts/'.$first->json('data.attempt.id').'/complete', ['result' => ['images' => 1]])
+        $this->asAttempt($first->json('data.claims.0.lease_token'))
+            ->postJson('/api/runner/attempts/'.$first->json('data.claims.0.attempt.id').'/complete', ['result' => ['images' => 1]])
             ->assertStatus(409)->assertJsonPath('code', 'lease_lost');
 
-        $this->asAttempt($second->json('data.lease_token'))
-            ->postJson('/api/runner/attempts/'.$second->json('data.attempt.id').'/complete', ['result' => ['images' => 1]])
+        $this->asAttempt($second->json('data.claims.0.lease_token'))
+            ->postJson('/api/runner/attempts/'.$second->json('data.claims.0.attempt.id').'/complete', ['result' => ['images' => 1]])
             ->assertOk();
 
         $this->getJson("/api/runs/{$runId}/attempts")
@@ -154,8 +154,8 @@ class RunnerFlowTest extends TestCase
     {
         $this->createRun();
         $claim = $this->claim();
-        $attempt = $claim->json('data.attempt.id');
-        $token = $claim->json('data.lease_token');
+        $attempt = $claim->json('data.claims.0.attempt.id');
+        $token = $claim->json('data.claims.0.lease_token');
 
         $this->travel(60)->seconds();
         $this->asAttempt($token)->postJson("/api/runner/attempts/{$attempt}/heartbeat")->assertOk();
@@ -171,9 +171,9 @@ class RunnerFlowTest extends TestCase
         $runId = $this->createRun(['max_attempts' => 2])->json('data.run.id');
 
         foreach ([['queued', 1], ['failed', 2]] as [$status, $number]) {
-            $claim = $this->claim()->assertJsonPath('data.attempt.number', $number);
-            $this->asAttempt($claim->json('data.lease_token'))
-                ->postJson('/api/runner/attempts/'.$claim->json('data.attempt.id').'/fail', ['error_code' => 'browser_crashed'])
+            $claim = $this->claim()->assertJsonPath('data.claims.0.attempt.number', $number);
+            $this->asAttempt($claim->json('data.claims.0.lease_token'))
+                ->postJson('/api/runner/attempts/'.$claim->json('data.claims.0.attempt.id').'/fail', ['error_code' => 'browser_crashed'])
                 ->assertOk()
                 ->assertJsonPath('data.status', $status);
         }
@@ -187,8 +187,8 @@ class RunnerFlowTest extends TestCase
         $this->createRun(['max_attempts' => 3]);
         $claim = $this->claim();
 
-        $this->asAttempt($claim->json('data.lease_token'))
-            ->postJson('/api/runner/attempts/'.$claim->json('data.attempt.id').'/fail', ['error_code' => 'blocked_url'])
+        $this->asAttempt($claim->json('data.claims.0.lease_token'))
+            ->postJson('/api/runner/attempts/'.$claim->json('data.claims.0.attempt.id').'/fail', ['error_code' => 'blocked_url'])
             ->assertJsonPath('data.status', 'failed');
     }
 
@@ -197,8 +197,8 @@ class RunnerFlowTest extends TestCase
     {
         $runId = $this->createRun()->json('data.run.id');
         $claim = $this->claim();
-        $attempt = $claim->json('data.attempt.id');
-        $token = $claim->json('data.lease_token');
+        $attempt = $claim->json('data.claims.0.attempt.id');
+        $token = $claim->json('data.claims.0.lease_token');
 
         $this->postJson("/api/runs/{$runId}/cancel")->assertOk()->assertJsonPath('data.status', 'cancelling');
         $this->asAttempt($token)->postJson("/api/runner/attempts/{$attempt}/heartbeat")->assertJsonPath('data.cancel_requested', true);

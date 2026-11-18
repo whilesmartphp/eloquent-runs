@@ -15,6 +15,10 @@ use Whilesmart\Runs\Models\RunDispatch;
 use Whilesmart\Runs\Models\RunLogChunk;
 
 return [
+    // UUID primary keys, owner columns and references instead of integers.
+    // Set it before the first migration; it decides the column types.
+    'uuids' => (bool) env('RUNS_UUIDS', false),
+
     'register_routes' => env('RUNS_REGISTER_ROUTES', true),
     'route_prefix' => env('RUNS_ROUTE_PREFIX', 'api'),
     'route_middleware' => ['api', 'auth:sanctum'],

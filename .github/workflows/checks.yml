@@ -13,6 +13,9 @@ jobs:
       fail-fast: false
       matrix:
         php-version: ['8.2', '8.3', '8.4']
+        uuids: ['false', 'true']
+    env:
+      RUNS_UUIDS: ${{ matrix.uuids }}
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -31,6 +34,10 @@ jobs:
 
   mysql:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        uuids: ['false', 'true']
     services:
       mysql:
         image: mysql:8.0
@@ -51,6 +58,7 @@ jobs:
       DB_DATABASE: runs_tests
       DB_USERNAME: root
       DB_PASSWORD: testing-password
+      RUNS_UUIDS: ${{ matrix.uuids }}
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -63,4 +71,45 @@ jobs:
       - name: Install dependencies
         run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist
       - name: Run tests against MySQL
+        run: vendor/bin/testbench package:test
+
+  pgsql:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        uuids: ['false', 'true']
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: testing-password
+          POSTGRES_DB: runs_tests
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      DB_CONNECTION: pgsql
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_DATABASE: runs_tests
+      DB_USERNAME: postgres
+      DB_PASSWORD: testing-password
+      RUNS_UUIDS: ${{ matrix.uuids }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Setup PHP
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962
+        with:
+          php-version: '8.4'
+          extensions: mbstring, pdo, pdo_pgsql, pdo_sqlite, sqlite
+          coverage: none
+      - name: Install dependencies
+        run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist
+      - name: Run tests against PostgreSQL
         run: vendor/bin/testbench package:test

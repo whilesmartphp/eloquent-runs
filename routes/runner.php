@@ -12,6 +12,8 @@ if (config('runs.register_runner_routes', false)) {
 
 Route::post('attempts/{attempt}/heartbeat', [$attempts, 'heartbeat']);
 Route::post('attempts/{attempt}/logs', [$attempts, 'logs']);
+Route::post('attempts/{attempt}/manifest', [$attempts, 'manifest']);
 Route::post('attempts/{attempt}/artifacts', [$attempts, 'artifact']);
 Route::post('attempts/{attempt}/complete', [$attempts, 'complete']);
 Route::post('attempts/{attempt}/fail', [$attempts, 'fail']);
+Route::post('attempts/{attempt}/wait', [$attempts, 'wait']);

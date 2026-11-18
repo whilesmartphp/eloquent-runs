@@ -21,7 +21,9 @@ composer require whilesmart/eloquent-runs
 php artisan migrate
 ```
 
-Schedule the sweep, which expires abandoned attempts, times out overdue runs and recovers queued work:
+For UUID keys instead of integers, set `RUNS_UUIDS=true` before the first migration. It changes the type of every id, owner and reference column, so it cannot be switched later.
+
+Schedule the sweep, which expires abandoned attempts, resumes runs whose wait is over, times out overdue runs and recovers queued work:
 
 ```php
 Schedule::command('runs:sweep')->everyMinute();
@@ -85,6 +87,31 @@ By default, a repeated idempotency key returns the owner's original run. Hosts c
 
 For HTTP creation, replace `requests.store_run` with a request that computes and validates the fingerprint from trusted, normalized input. The default request does not accept a client-supplied fingerprint. Include every field that changes the meaning of the work, and keep the normalization stable across deployments.
 
+## Concurrency
+
+Runs that share a `concurrency_key` for the same owner follow the `concurrency_policy` given when each is created:
+
+| Policy | A new run with the key |
+|---|---|
+| `parallel` (default) | Runs alongside the others |
+| `queue` | Waits until every earlier unfinished run with the key has finished, then starts in order |
+| `reject` | Is refused with `409 concurrency_busy` while another run with the key is unfinished |
+| `supersede` | Cancels the unfinished runs with the key, then starts |
+
+A deploy per app might use `queue`; a review run per pull request might use `supersede`, so a new push replaces the review of the old one. Reported runs start at once, so they cannot use `queue`.
+
+## Waiting
+
+A run can pause until something outside it happens, such as a person answering a question. The attempt holding it calls `wait` with a reason, optional `state` and an optional `resume_at`; the attempt ends and the run becomes `waiting`, holding no lease. `POST /runs/{run}/resume` merges its `data` into the run's `state` and queues the run, and the next attempt carries on from that state. The sweep resumes runs whose `resume_at` has passed. Waiting does not use up retries.
+
+A queue handler waits by throwing `RunWaits`.
+
+## Declared files
+
+An attempt can declare its files before uploading them, with each file's path, media type, size and SHA-256. Completion then fails with `409 artifacts_missing`, listing the paths, until every declared file has arrived, and an upload must match its declaration. Readers only ever see files that have arrived.
+
+Hosts that receive uploads through their own routes pass the bytes to `RunService::receiveArtifact()`, which checks them against the declaration. Hosts that let clients upload straight to object storage call `RunService::markArtifactReceived()` with the disk and key.
+
 ## Authorization
 
 People reach runs through [`eloquent-owner-access`](https://github.com/whilesmartphp/eloquent-owner-access): bind an `OwnerAuthorizer` that decides who may use which owner's runs.
@@ -105,7 +132,8 @@ User routes use `route_middleware` (default `api`, `auth:sanctum`) under `route_
 | GET | `/runs` | List runs; filter by `type`, `status`, `execution_mode`, `trigger_name`, and `owner_*`, `subject_*` or `trigger_*` pairs |
 | POST | `/runs` | Create a run. A repeated `idempotency_key` for the same owner returns the first run. A `reported` run also returns its upload attempt and token |
 | GET | `/runs/{run}` | Show a run |
-| POST | `/runs/{run}/cancel` | Cancel a queued run at once, or ask a running machine to stop |
+| POST | `/runs/{run}/cancel` | Cancel a queued or waiting run at once, or ask a running machine to stop |
+| POST | `/runs/{run}/resume` | Continue a waiting run, merging `data` into its state |
 | GET | `/runs/{run}/attempts` | List attempts |
 | GET | `/runs/{run}/artifacts` | Files of the accepted attempt, so none before the run succeeds; `?all=1` for every attempt |
 | GET | `/runs/{run}/artifacts/{artifact}` | Download a file |
@@ -115,18 +143,22 @@ Runner routes use `runner_route_middleware` (default `api`) under `runner_route_
 
 | Method | Path | Does |
 |---|---|---|
-| POST | `/claim` | Take the oldest available run; `204` when there is none |
+| POST | `/claim` | Take up to `limit` (default 1, at most 50) of the oldest available runs as `claims`; `204` when there are none. `metadata` is recorded on each attempt |
 | POST | `/attempts/{attempt}/heartbeat` | Extend the lease and report progress; answers whether cancellation was requested |
 | POST | `/attempts/{attempt}/logs` | Append numbered log lines; a resent number is skipped |
+| POST | `/attempts/{attempt}/manifest` | Declare the files the attempt will upload |
 | POST | `/attempts/{attempt}/artifacts` | Upload a file with its path and optional checksum |
 | POST | `/attempts/{attempt}/complete` | Settle the run with a result |
 | POST | `/attempts/{attempt}/fail` | Fail the attempt; the run retries if its type allows the error code, attempts remain and its deadline has not passed |
+| POST | `/attempts/{attempt}/wait` | Park the run with a `reason`, optional `state` and optional `resume_at` |
 
-A request that no longer matches the run's state, such as completing after the lease expired, gets `409` with a `code`.
+Heartbeat, complete, fail and wait accept `metadata`, merged into the attempt's metadata: which machine or version ran it, what it cost.
+
+A request that no longer matches the run's state, such as completing after the lease expired, gets `409` with a `code`, and `details` when there is more to say.
 
 ## Events
 
-Dispatched after the database commit: `RunCreated`, `RunClaimed`, `RunRetryScheduled`, `RunCancellationRequested`, `RunSettled`, `ArtifactReceived`.
+Dispatched after the database commit: `RunCreated`, `RunClaimed`, `RunRetryScheduled`, `RunCancellationRequested`, `RunWaiting`, `RunResumed`, `RunSettled`, `ArtifactReceived`.
 
 ## Customization
 

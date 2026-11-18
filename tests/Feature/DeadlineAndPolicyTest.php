@@ -69,8 +69,8 @@ class DeadlineAndPolicyTest extends TestCase
         $this->createRun(['max_attempts' => 3]);
         $claim = $this->claim();
 
-        $this->asAttempt($claim->json('data.lease_token'))
-            ->postJson('/api/runner/attempts/'.$claim->json('data.attempt.id').'/fail', ['error_code' => 'blocked_url', 'retryable' => true])
+        $this->asAttempt($claim->json('data.claims.0.lease_token'))
+            ->postJson('/api/runner/attempts/'.$claim->json('data.claims.0.attempt.id').'/fail', ['error_code' => 'blocked_url', 'retryable' => true])
             ->assertJsonPath('data.status', 'failed');
     }
 
@@ -81,7 +81,7 @@ class DeadlineAndPolicyTest extends TestCase
         $runId = $this->createRun()->json('data.run.id');
         $claim = $this->claim();
 
-        $this->asAttempt($claim->json('data.lease_token'))->post('/api/runner/attempts/'.$claim->json('data.attempt.id').'/artifacts', [
+        $this->asAttempt($claim->json('data.claims.0.lease_token'))->post('/api/runner/attempts/'.$claim->json('data.claims.0.attempt.id').'/artifacts', [
             'file' => UploadedFile::fake()->createWithContent('a.png', 'partial'),
             'path' => 'a.png',
         ], ['Accept' => 'application/json'])->assertCreated();
@@ -96,8 +96,8 @@ class DeadlineAndPolicyTest extends TestCase
         Storage::fake('local');
         $runId = $this->createRun()->json('data.run.id');
         $claim = $this->claim();
-        $upload = fn (string $bytes) => $this->asAttempt($claim->json('data.lease_token'))->post(
-            '/api/runner/attempts/'.$claim->json('data.attempt.id').'/artifacts',
+        $upload = fn (string $bytes) => $this->asAttempt($claim->json('data.claims.0.lease_token'))->post(
+            '/api/runner/attempts/'.$claim->json('data.claims.0.attempt.id').'/artifacts',
             ['file' => UploadedFile::fake()->createWithContent('a.png', $bytes), 'path' => 'a.png'],
             ['Accept' => 'application/json'],
         );
@@ -124,7 +124,8 @@ class DeadlineAndPolicyTest extends TestCase
             $raced = true;
             Storage::disk('local')->put('winner', 'winner-bytes');
             DB::table('work_run_artifacts')->insert([
-                ...$artifact->getAttributes(),
+                ...collect($artifact->getAttributes())->except('id')->all(),
+                ...(config('runs.uuids') ? ['id' => (string) str()->orderedUuid()] : []),
                 'public_id' => strtolower((string) str()->ulid()),
                 'sha256' => hash('sha256', 'winner-bytes'),
                 'storage_key' => 'winner',
@@ -132,8 +133,8 @@ class DeadlineAndPolicyTest extends TestCase
             ]);
         });
 
-        $this->asAttempt($claim->json('data.lease_token'))->post(
-            '/api/runner/attempts/'.$claim->json('data.attempt.id').'/artifacts',
+        $this->asAttempt($claim->json('data.claims.0.lease_token'))->post(
+            '/api/runner/attempts/'.$claim->json('data.claims.0.attempt.id').'/artifacts',
             ['file' => UploadedFile::fake()->createWithContent('a.png', 'loser-bytes'), 'path' => 'a.png'],
             ['Accept' => 'application/json'],
         )->assertStatus(409)->assertJsonPath('code', 'artifact_exists');

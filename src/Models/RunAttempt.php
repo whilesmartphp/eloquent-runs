@@ -8,11 +8,12 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\MorphTo;
 use Whilesmart\Runs\Enums\AttemptStatus;
 use Whilesmart\Runs\Models\Concerns\HasPublicId;
+use Whilesmart\Runs\Models\Concerns\UsesConfiguredKeys;
 use Whilesmart\Runs\Support\RunModels;
 
 class RunAttempt extends Model
 {
-    use HasPublicId;
+    use HasPublicId, UsesConfiguredKeys;
 
     protected $guarded = ['id'];
 
@@ -22,6 +23,7 @@ class RunAttempt extends Model
         'status' => AttemptStatus::class,
         'number' => 'integer',
         'result' => 'array',
+        'metadata' => 'array',
         'lease_expires_at' => 'datetime',
         'heartbeat_at' => 'datetime',
         'deadline_at' => 'datetime',

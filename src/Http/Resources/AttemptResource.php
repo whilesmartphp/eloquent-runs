@@ -20,6 +20,7 @@ class AttemptResource extends JsonResource
             'deadline_at' => $this->deadline_at?->toIso8601String(),
             'started_at' => $this->started_at?->toIso8601String(),
             'finished_at' => $this->finished_at?->toIso8601String(),
+            'metadata' => $this->metadata,
             'error_code' => $this->error_code,
             'error_message' => $this->error_message,
         ];

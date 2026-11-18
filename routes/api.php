@@ -9,6 +9,7 @@ Route::get('runs', [$runs, 'index']);
 Route::post('runs', [$runs, 'store']);
 Route::get('runs/{run}', [$runs, 'show']);
 Route::post('runs/{run}/cancel', [$runs, 'cancel']);
+Route::post('runs/{run}/resume', [$runs, 'resume']);
 Route::get('runs/{run}/attempts', [$runs, 'attempts']);
 Route::get('runs/{run}/artifacts', [$runs, 'artifacts']);
 Route::get('runs/{run}/artifacts/{artifact}', [$runs, 'download']);

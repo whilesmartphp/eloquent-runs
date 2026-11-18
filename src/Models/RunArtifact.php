@@ -5,11 +5,12 @@ namespace Whilesmart\Runs\Models;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Whilesmart\Runs\Models\Concerns\HasPublicId;
+use Whilesmart\Runs\Models\Concerns\UsesConfiguredKeys;
 use Whilesmart\Runs\Support\RunModels;
 
 class RunArtifact extends Model
 {
-    use HasPublicId;
+    use HasPublicId, UsesConfiguredKeys;
 
     protected $guarded = ['id'];
 
